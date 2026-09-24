@@ -39,6 +39,9 @@ LIVE = {"data": b"", "width": 0, "height": 0, "at": 0.0}
 # WebRTC のSDP受け渡し（iPhone=送信側がoffer、PC受信ページがanswer）
 RTC = {"offer_id": 0, "offer": "", "answer_id": 0, "answer": "", "want": 0}
 MAX_SDP = 256 * 1024
+# ローカルCAが有効になる範囲（Name Constraints）。これ以外のサイトの証明書はこのCAでは作れない
+PERMITTED_NETS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.0/8"]
+PERMITTED_DNS = ["localhost"]
 
 
 def jpeg_size(data: bytes) -> tuple[int, int] | None:
@@ -224,9 +227,27 @@ def ensure_certs(ips: list[str]) -> tuple[Path, Path]:
     server_key_path = CERTS / "server.key"
     chain_path = CERTS / "server-chain.pem"
     stamp_path = CERTS / "ips.txt"
-    names = sorted(set(ips + ["127.0.0.1"]))
-    stamp = "\n".join(names)
-    if ca_key_path.is_file() and ca_cert_path.is_file() and chain_path.is_file() and server_key_path.is_file() and stamp_path.is_file():
+    nets = [ipaddress.ip_network(n) for n in PERMITTED_NETS]
+
+    def permitted(ip: str) -> bool:
+        return any(ipaddress.ip_address(ip) in n for n in nets)
+
+    skipped = [ip for ip in ips if not permitted(ip)]
+    if skipped:
+        print("証明書の対象外（LAN外）のアドレス:", ", ".join(skipped), flush=True)
+    names = sorted(set([ip for ip in ips if permitted(ip)] + ["127.0.0.1"]))
+    stamp = "nc1\n" + "\n".join(names)
+
+    def ca_is_constrained() -> bool:
+        try:
+            cert = x509.load_pem_x509_certificate(ca_cert_path.read_bytes())
+            cert.extensions.get_extension_for_class(x509.NameConstraints)
+            return True
+        except Exception:
+            return False
+
+    constrained = ca_key_path.is_file() and ca_cert_path.is_file() and ca_is_constrained()
+    if constrained and chain_path.is_file() and server_key_path.is_file() and stamp_path.is_file():
         if stamp_path.read_text(encoding="ascii").strip() == stamp:
             return chain_path, server_key_path
 
@@ -241,10 +262,12 @@ def ensure_certs(ips: list[str]) -> tuple[Path, Path]:
         ))
 
     now = datetime.now(timezone.utc)
-    if ca_key_path.is_file() and ca_cert_path.is_file():
+    if constrained:
         ca_key = serialization.load_pem_private_key(ca_key_path.read_bytes(), password=None)
         ca_cert = x509.load_pem_x509_certificate(ca_cert_path.read_bytes())
     else:
+        if ca_cert_path.is_file():
+            print("証明書をLAN限定の新しいものに作り直しました。iPhoneでQR「1. 証明書」から入れ直してください。", flush=True)
         ca_key = new_key()
         ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "iPhone Capture Local CA")])
         ca_cert = (
@@ -256,6 +279,10 @@ def ensure_certs(ips: list[str]) -> tuple[Path, Path]:
             .not_valid_before(now - timedelta(days=1))
             .not_valid_after(now + timedelta(days=3650))
             .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+            .add_extension(x509.NameConstraints(
+                permitted_subtrees=[x509.DNSName(d) for d in PERMITTED_DNS] + [x509.IPAddress(n) for n in nets],
+                excluded_subtrees=None,
+            ), critical=True)
             .add_extension(x509.KeyUsage(
                 digital_signature=True, content_commitment=False, key_encipherment=False,
                 data_encipherment=False, key_agreement=False, key_cert_sign=True, crl_sign=True,
@@ -273,7 +300,7 @@ def ensure_certs(ips: list[str]) -> tuple[Path, Path]:
         san.append(x509.IPAddress(ipaddress.ip_address(ip)))
     server_cert = (
         x509.CertificateBuilder()
-        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, names[0])]))
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")]))
         .issuer_name(ca_cert.subject)
         .public_key(server_key.public_key())
         .serial_number(x509.random_serial_number())

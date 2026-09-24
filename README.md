@@ -32,6 +32,7 @@ iPhoneをUSB接続し、インターネット共有をオンにしてから `sta
 
 ## 仕組み
 - iPhoneのSafariはHTTPSでないとカメラを使えないため、ローカルCAを自動生成して `certs/` に保存し、iPhoneに信頼させます（QR 1）。
+- ローカルCAには Name Constraints を付けており、LAN内のIP（10/8・172.16/12・192.168/16・100.64/10・127/8）と localhost 以外の証明書は発行できません。旧版の証明書は起動時に自動で作り直されるので、iPhoneでQR 1から入れ直してください。
 - 映像は `getUserMedia` → WebRTC（H.264優先、上限 5/10/25Mbps）。SDPの受け渡しは同じPythonサーバーが行います（STUNなし＝LAN内専用）。
 - URLのキーは起動ごとに変わります。`/cam` はPC自身（127.0.0.1）からのみキー不要。
 
