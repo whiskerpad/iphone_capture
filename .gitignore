@@ -1,0 +1,10 @@
+# 秘密鍵・証明書（起動時に自動生成）
+certs/
+# 撮影画像
+captures/
+page.url
+__pycache__/
+*.pyc
+*.bak
+*.bak_*
+blog_draft.md
