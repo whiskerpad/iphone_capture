@@ -44,6 +44,15 @@ PERMITTED_NETS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/1
 PERMITTED_DNS = ["localhost"]
 
 
+def lan_ok(ip: str) -> bool:
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in ipaddress.ip_network(n) for n in PERMITTED_NETS)
+
+
 def jpeg_size(data: bytes) -> tuple[int, int] | None:
     """JPEGのSOFから幅と高さを読む。画像の展開はしない。"""
     if len(data) < 4 or data[:2] != b"\xff\xd8":
@@ -134,7 +143,7 @@ def local_endpoints() -> list[tuple[str, str]]:
     except OSError:
         pass
 
-    def rank(item: tuple[str, str]) -> tuple[int, int, int, str]:
+    def rank(item: tuple[str, str]) -> tuple[int, int, str]:
         ip, label = item
         folded = label.lower()
         wifi = 0 if ("wi-fi" in folded or "wifi" in folded or "wlan" in folded or "ワイヤレス" in label or "wireless" in folded) else 1
@@ -145,9 +154,7 @@ def local_endpoints() -> list[tuple[str, str]]:
         else:
             parts = ip.split(".")
             band = 2 if parts[0] == "172" and parts[1].isdigit() and 16 <= int(parts[1]) <= 31 else 3
-        # iPhoneのインターネット共有（USB/Wi-Fi）は 172.20.10.x。つながっていれば最優先
-        usb = 0 if ip.startswith("172.20.10.") else 1
-        return (usb, wifi, band, ip)
+        return (wifi, band, ip)
 
     return sorted(found, key=rank)
 
@@ -807,7 +814,8 @@ PC_PAGE = r"""<!DOCTYPE html>
     <div class="qrbox"><div id="qr-setup"></div><p>1. 証明書</p></div>
     <div class="qrbox"><div id="qr-camera"></div><p>2. 撮影ページ</p></div>
   </div>
-  <p id="which"></p>
+  <p id="which">QRのアドレス: <select id="addr"></select></p>
+  <p class="note">iPhoneがつながっているネットワーク（Wi-Fiなど）と同じアドレスを選んでください。</p>
   <ol>
     <li>iPhoneのカメラで「1. 証明書」を読み、リンクを開く</li>
     <li>プロファイルを入れ、設定 → 一般 → VPNとデバイス管理 でインストール</li>
@@ -828,12 +836,26 @@ function drawQr(id, text) {
   code.make();
   document.getElementById(id).innerHTML = code.createSvgTag(6, 2);
 }
-drawQr("qr-setup", DATA.setupUrl);
+const addrSel = document.getElementById("addr");
+(DATA.endpoints || []).forEach((ep, i) => {
+  const o = document.createElement("option");
+  o.value = String(i);
+  o.textContent = ep.ip + "（" + ep.label + "）";
+  addrSel.appendChild(o);
+});
+function drawAddr() {
+  const ep = (DATA.endpoints || [])[Number(addrSel.value)] || { setupUrl: DATA.setupUrl, cameraUrl: DATA.cameraUrl };
+  document.getElementById("qr-setup").innerHTML = "";
+  document.getElementById("qr-camera").innerHTML = "";
+  drawQr("qr-setup", ep.setupUrl);
+  drawQr("qr-camera", ep.cameraUrl);
+}
+addrSel.addEventListener("change", drawAddr);
+drawAddr();
 const camlink = document.getElementById("camlink");
 camlink.href = DATA.camUrl + "?stats=1";
 camlink.textContent = DATA.camUrl;
-drawQr("qr-camera", DATA.cameraUrl);
-document.getElementById("which").textContent = DATA.label ? ("QRのアドレス: " + DATA.label) : "";
+
 const meta = document.getElementById("meta");
 const saved = document.getElementById("saved");
 const path = document.getElementById("path");
@@ -1036,6 +1058,7 @@ HELP_PAGE = """<!DOCTYPE html>
 class Handler(BaseHTTPRequestHandler):
     token = ""
     camera_url = ""
+    https_port = 8443
     page_data = "{}"
 
     def log_message(self, fmt: str, *args) -> None:
@@ -1149,7 +1172,9 @@ class Handler(BaseHTTPRequestHandler):
         ios = re.search(r"iPhone|iPad|iPod", self.headers.get("User-Agent", ""))
         https = isinstance(self.connection, ssl.SSLSocket)
         if ios and not https:
-            self.send_html(INSTALL_PAGE.replace("__CAMERA_URL__", json.dumps(self.camera_url)))
+            host = (self.headers.get("Host", "") or "").rsplit(":", 1)[0].strip("[]")
+            camera_url = f"https://{host}:{self.https_port}/k/{self.token}" if lan_ok(host) else self.camera_url
+            self.send_html(INSTALL_PAGE.replace("__CAMERA_URL__", json.dumps(camera_url)))
             return
         if ios and https:
             self.send_html(PHONE_PAGE.replace("__TOKEN__", json.dumps(self.token)))
@@ -1381,17 +1406,25 @@ def main() -> None:
     context.load_cert_chain(chain, key)
 
     token = secrets.token_hex(4)
-    primary = endpoints[0] if endpoints else ("", "")
+    lan = [(ip, label) for ip, label in endpoints if lan_ok(ip)]
+    primary = lan[0] if lan else ("", "")
     setup_url = f"http://{primary[0]}:{http_port}/k/{token}" if primary[0] else ""
     camera_url = f"https://{primary[0]}:{https_port}/k/{token}" if primary[0] else ""
     Handler.token = token
     Handler.camera_url = camera_url
+    Handler.https_port = https_port
     Handler.page_data = json.dumps({
         "token": token,
         "folder": str(CAPTURES),
         "setupUrl": setup_url,
         "cameraUrl": camera_url,
         "label": primary[1],
+        "endpoints": [{
+            "ip": ip,
+            "label": label,
+            "setupUrl": f"http://{ip}:{http_port}/k/{token}",
+            "cameraUrl": f"https://{ip}:{https_port}/k/{token}",
+        } for ip, label in lan],
         "camUrl": f"http://127.0.0.1:{http_port}/cam",
     }, ensure_ascii=False).replace("<", "\\u003c")
 
@@ -1405,9 +1438,12 @@ def main() -> None:
     print(local_url, flush=True)
     if setup_url:
         print("iPhoneは、画面のQRを 1、2 の順に読んでください。", flush=True)
-        print(primary[1], flush=True)
+        for ip, label in lan:
+            print(f"  {label}  {ip}", flush=True)
         print(setup_url, flush=True)
         print(camera_url, flush=True)
+        if len(lan) > 1:
+            print("iPhoneがつながらないときは、受信ページの「QRのアドレス」でiPhoneと同じネットワークを選んでください。", flush=True)
     else:
         print("LANのIPv4が見つかりません。ipconfig のWi-Fiアドレスを確認してください。", flush=True)
     print("リアルタイム映像(OBSブラウザソース用):", f"http://127.0.0.1:{http_port}/cam", flush=True)
