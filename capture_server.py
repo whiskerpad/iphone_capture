@@ -494,6 +494,7 @@ PHONE_PAGE = r"""<!DOCTYPE html>
     <option value="1080" selected>リアルタイム 1080p</option>
     <option value="2160">リアルタイム 4K（Wi-Fi/USBが速い場合）</option>
   </select>
+  <button id="mic" class="secondary" type="button">マイク: オフ（押すとオン）</button>
   <button id="go" class="primary" type="button">カメラを開始</button>
   <button id="save" class="secondary" type="button">今の画角を保存</button>
   <label class="primary">高解像度で撮影
@@ -559,14 +560,28 @@ async function postJpeg(path, blob) {
 async function startCamera() {
   status.textContent = "カメラを開始しています…";
   if (stream) stream.getTracks().forEach((track) => track.stop());
+  const videoOpt = Object.assign({ facingMode: { ideal: facing }, frameRate: { ideal: 30 } }, SIZES[quality.value] || SIZES["1080"]);
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: Object.assign({ facingMode: { ideal: facing }, frameRate: { ideal: 30 } }, SIZES[quality.value] || SIZES["1080"]),
+      audio: micOn ? { echoCancellation: true, noiseSuppression: true, autoGainControl: true } : false,
+      video: videoOpt,
     });
   } catch (err) {
-    status.textContent = "カメラを開始できません。証明書の信頼設定のあと、このページを開き直してください。";
-    return;
+    if (micOn) {
+      // マイクだけ拒否された場合は映像のみで続ける
+      micOn = false;
+      updateMicButton();
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: videoOpt });
+        status.textContent = "マイクを使えませんでした（設定 → Safari → マイク を確認）。映像のみ送ります。";
+      } catch (err2) {
+        status.textContent = "カメラを開始できません。証明書の信頼設定のあと、このページを開き直してください。";
+        return;
+      }
+    } else {
+      status.textContent = "カメラを開始できません。証明書の信頼設定のあと、このページを開き直してください。";
+      return;
+    }
   }
   video.srcObject = stream;
   await video.play();
@@ -641,6 +656,8 @@ const SIZES = {
 const quality = document.getElementById("quality");
 const rtcLine = document.getElementById("rtc");
 let pc = null;
+let micOn = false;
+let pcHasAudio = false;
 let offerId = 0;
 let lastWant = -1;
 let lastJpeg = 0;
@@ -708,6 +725,9 @@ async function offer() {
   prevBytes = 0;
   prevTs = 0;
   const tr = conn.addTransceiver(track, { direction: "sendonly", streams: [stream] });
+  const audioTrack = stream.getAudioTracks()[0];
+  if (audioTrack) conn.addTransceiver(audioTrack, { direction: "sendonly", streams: [stream] });
+  pcHasAudio = !!audioTrack;
   const caps = window.RTCRtpSender && RTCRtpSender.getCapabilities && RTCRtpSender.getCapabilities("video");
   if (caps && tr.setCodecPreferences) {
     const h264 = caps.codecs.filter((c) => /h264/i.test(c.mimeType));
@@ -733,7 +753,7 @@ async function pollAnswer(conn, id) {
       const r = await api("GET", "/rtc/answer?id=" + id);
       if (r.sdp && conn === pc && !conn.remoteDescription) {
         await conn.setRemoteDescription({ type: "answer", sdp: r.sdp });
-        await tuneSender(conn.getSenders()[0]);
+        await tuneSender(videoSender(conn));
         return;
       }
     } catch (e) {}
@@ -741,17 +761,42 @@ async function pollAnswer(conn, id) {
   }
 }
 
+function videoSender(conn) {
+  const t = conn && conn.getTransceivers().find((x) => x.sender && x.receiver && x.receiver.track && x.receiver.track.kind === "video");
+  return t ? t.sender : null;
+}
+function audioSender(conn) {
+  const t = conn && conn.getTransceivers().find((x) => x.sender && x.receiver && x.receiver.track && x.receiver.track.kind === "audio");
+  return t ? t.sender : null;
+}
+
 async function attachTrack() {
   const track = stream && stream.getVideoTracks()[0];
   if (!track) return;
-  const sender = pc && pc.getSenders()[0];
-  if (sender && pc.connectionState !== "failed" && pc.connectionState !== "closed") {
+  const audioTrack = stream.getAudioTracks()[0] || null;
+  const sender = videoSender(pc);
+  const usable = sender && pc.connectionState !== "failed" && pc.connectionState !== "closed";
+  if (usable && pcHasAudio === !!audioTrack) {
     await sender.replaceTrack(track);
+    if (audioTrack) await audioSender(pc).replaceTrack(audioTrack);
     await tuneSender(sender);
   } else {
+    // マイクのオン/オフが変わったときは接続し直す
     await offer();
   }
 }
+
+function updateMicButton() {
+  const b = document.getElementById("mic");
+  b.textContent = micOn ? "マイク: オン（押すとオフ）" : "マイク: オフ（押すとオン）";
+  b.style.borderColor = micOn ? "#e55" : "";
+  b.style.color = micOn ? "#f88" : "";
+}
+document.getElementById("mic").addEventListener("click", () => {
+  micOn = !micOn;
+  updateMicButton();
+  if (stream) startCamera();
+});
 
 async function watchWant() {
   // PC側の受信ページ(OBS等)が開き直されたら新しいofferを出す
@@ -830,7 +875,7 @@ async function showStats() {
   const pr = selectedPair(rep);
   let r = routeOf(pr && pr.remote, pr && pr.local);
   if (r.kind === "lan" && !r.label) r = routeOf(location.hostname, pr && pr.local);
-  rtcLine.textContent += " ／ 経路: " + routeText(r);
+  rtcLine.textContent += " ／ 経路: " + routeText(r) + (pcHasAudio ? " ／ マイク送信中" : "");
   rtcLine.style.color = r.kind === "usb" ? "#6cf" : "#8fd18f";
 }
 
@@ -1026,7 +1071,7 @@ CAM_PAGE = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-<video id="v" autoplay playsinline muted></video>
+<video id="v" autoplay playsinline></video>
 <div id="info" hidden></div>
 <script>
 const TOKEN = __TOKEN__;
@@ -1066,17 +1111,31 @@ function waitIce(conn) {
   });
 }
 
+let blockedSound = false;
+function playWithSound() {
+  // 音声付きで再生。ブラウザの自動再生制限で止められたら無音で映像だけ出す
+  video.muted = false;
+  video.play().then(() => { blockedSound = false; }).catch(() => {
+    blockedSound = true;
+    video.muted = true;
+    video.play().catch(() => {});
+  });
+}
+document.addEventListener("click", () => { if (blockedSound) playWithSound(); });
+
 async function answer(id, sdp) {
   if (pc) pc.close();
   const conn = new RTCPeerConnection({ iceServers: [] });
   pc = conn;
   prevBytes = 0;
   prevTs = 0;
+  const remote = new MediaStream();
   conn.ontrack = (e) => {
     try { e.receiver.jitterBufferTarget = 0; } catch (_) {}
     try { e.receiver.playoutDelayHint = 0; } catch (_) {}
-    video.srcObject = e.streams[0] || new MediaStream([e.track]);
-    video.play().catch(() => {});
+    remote.addTrack(e.track);
+    if (video.srcObject !== remote) video.srcObject = remote;
+    playWithSound();
   };
   conn.onconnectionstatechange = () => {
     if (conn === pc && conn.connectionState === "failed") api("POST", "/rtc/request").catch(() => {});
@@ -1154,6 +1213,14 @@ async function reportRoute() {
 }
 setInterval(() => { reportRoute().catch(() => {}); }, 2000);
 
+function audioText(rep) {
+  let a = null;
+  rep.forEach((s) => { if (s.type === "inbound-rtp" && s.kind === "audio") a = s; });
+  if (!a) return "\n音声: なし（iPhoneのマイクがオフ）";
+  const lv = typeof a.audioLevel === "number" ? " レベル " + Math.round(a.audioLevel * 100) + "%" : "";
+  return "\n音声: あり" + lv + (blockedSound ? "（自動再生が止められています。画面をクリックで再生）" : "");
+}
+
 async function stats() {
   if (!SHOW) return;
   if (!pc || pc.connectionState !== "connected") {
@@ -1174,7 +1241,7 @@ async function stats() {
   if (i.jitterBufferEmittedCount) delay = " バッファ" + Math.round(i.jitterBufferDelay / i.jitterBufferEmittedCount * 1000) + "ms";
   info.textContent = (i.frameWidth || "?") + "x" + (i.frameHeight || "?") + " " + Math.round(i.framesPerSecond || 0) + "fps " +
     mbps.toFixed(1) + "Mbps " + codec + delay + "\n欠落フレーム " + (i.framesDropped || 0) + " / パケットロス " + (i.packetsLost || 0) +
-    (lastRoute ? "\n経路: " + routeText(lastRoute) + " " + (lastRoute.iphone || "") : "");
+    (lastRoute ? "\n経路: " + routeText(lastRoute) + " " + (lastRoute.iphone || "") : "") + audioText(rep);
 }
 
 (async () => {
