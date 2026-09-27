@@ -33,6 +33,8 @@ iPhoneのSafariだけで、iPhoneのカメラをWindows PCの「Webカメラ」�
 ### 有線（USB）で使う
 iPhoneをUSB接続し、インターネット共有をオンにしてから `start.bat` を起動し、受信ページの「QRのアドレス」で 172.20.10.x（Apple Mobile Device Ethernet）を選びます。iTunes または Appleデバイスアプリが必要です。インターネット共有が使えない契約・SIMなしの端末では使えません。
 
+接続経路は受信ページ・iPhoneの撮影ページ・`/cam?stats=1` に「USB有線 / Wi-Fi / 有線LAN / iPhoneのインターネット共有(Wi-Fi)」などと表示されます（USB有線のときは青色）。リアルタイム映像と静止画・プレビューは別々に表示されます。
+
 ## 仕組み
 - iPhoneのSafariはHTTPSでないとカメラを使えないため、ローカルCAを自動生成して `certs/` に保存し、iPhoneに信頼させます（QR 1）。
 - ローカルCAには Name Constraints を付けており、LAN内のIP（10/8・172.16/12・192.168/16・100.64/10・127/8）と localhost 以外の証明書は発行できません。旧版の証明書は起動時に自動で作り直されるので、iPhoneでQR 1から入れ直してください。

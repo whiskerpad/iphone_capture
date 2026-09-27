@@ -44,6 +44,39 @@ PERMITTED_NETS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/1
 PERMITTED_DNS = ["localhost"]
 
 
+ADAPTERS: dict = {}
+VIA = {"ip": "", "at": 0.0}
+ROUTE = {"data": None, "at": 0.0}
+
+
+def classify(ip: str, label: str, desc: str) -> str:
+    """usb / tether / wifi / lan / tailscale / local"""
+    import ipaddress
+    text = f"{label} {desc}"
+    low = text.lower()
+    wifi = any(k in low for k in ("wi-fi", "wifi", "wlan", "wireless")) or "ワイヤレス" in text
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return "lan"
+    if addr.is_loopback:
+        return "local"
+    if "apple mobile device" in low:
+        return "usb"
+    if addr in ipaddress.ip_network("172.20.10.0/28"):
+        return "tether" if wifi else "usb"
+    if addr in ipaddress.ip_network("100.64.0.0/10") or "tailscale" in low:
+        return "tailscale"
+    return "wifi" if wifi else "lan"
+
+
+def adapter_info(ip: str) -> dict:
+    info = ADAPTERS.get(ip)
+    if info:
+        return dict(info)
+    return {"ip": ip, "label": "", "desc": "", "kind": classify(ip, "", "")}
+
+
 def lan_ok(ip: str) -> bool:
     import ipaddress
     try:
@@ -103,6 +136,7 @@ def local_endpoints() -> list[tuple[str, str]]:
     """(IPv4, アダプタ名) を返す。Wi-Fiを先に並べる。"""
     found: list[tuple[str, str]] = []
     seen: set[str] = set()
+    desc = ""
 
     def add(ip: str, label: str) -> None:
         ip = ip.strip()
@@ -112,10 +146,12 @@ def local_endpoints() -> list[tuple[str, str]]:
             return
         seen.add(ip)
         found.append((ip, label or ip))
+        if ip not in ADAPTERS:
+            ADAPTERS[ip] = {"ip": ip, "label": label, "desc": desc, "kind": classify(ip, label, desc)}
 
     output = ""
     try:
-        output = subprocess.check_output(["ipconfig"], stderr=subprocess.DEVNULL)
+        output = subprocess.check_output(["ipconfig", "/all"], stderr=subprocess.DEVNULL)
         output = output.decode("mbcs", errors="replace")
     except (OSError, subprocess.CalledProcessError, LookupError):
         output = ""
@@ -123,12 +159,17 @@ def local_endpoints() -> list[tuple[str, str]]:
     for line in output.splitlines():
         if line and not line.startswith(" ") and line.endswith(":"):
             adapter = line[:-1].strip()
+            desc = ""
+            continue
+        if re.match(r"\s+(説明|Description)[\s.]*:", line):
+            desc = line.split(":", 1)[1].strip()
             continue
         if "IPv4" not in line or ":" not in line:
             continue
         raw = re.split(r"[\s(]", line.split(":")[-1].strip(), maxsplit=1)[0]
         add(raw, adapter)
 
+    desc = ""
     try:
         probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         probe.connect(("8.8.8.8", 80))
@@ -214,6 +255,13 @@ def status() -> dict:
             "bytes": len(data),
             "age": round(time.time() - at, 1),
         }
+    with LOCK:
+        via_ip, via_at = VIA["ip"], VIA["at"]
+        route, route_at = ROUTE["data"], ROUTE["at"]
+    if via_ip and time.time() - via_at < 5:
+        record["via"] = adapter_info(via_ip)
+    if route and time.time() - route_at < 6:
+        record["route"] = route
     return record
 
 
@@ -717,10 +765,53 @@ async function watchWant() {
   }
 }
 
+
+const KIND_NAMES = { usb: "USB有線", tether: "iPhoneのインターネット共有(Wi-Fi)", wifi: "Wi-Fi", lan: "有線LAN", tailscale: "Tailscale", local: "このPC" };
+let netinfo = null;
+async function loadNet() {
+  try {
+    const res = await fetch("/netinfo", { headers: { "X-Token": TOKEN }, cache: "no-store" });
+    if (res.ok) netinfo = await res.json();
+  } catch (e) {}
+}
+function pcAdapter(ip) {
+  return ((netinfo && netinfo.endpoints) || []).find((e) => e.ip === ip) || null;
+}
+function selectedPair(rep) {
+  let pair = null;
+  rep.forEach((s) => { if (s.type === "transport" && s.selectedCandidatePairId) pair = rep.get(s.selectedCandidatePairId); });
+  if (!pair) rep.forEach((s) => { if (s.type === "candidate-pair" && s.state === "succeeded" && (s.nominated || s.selected)) pair = s; });
+  if (!pair) return null;
+  const l = rep.get(pair.localCandidateId);
+  const r = rep.get(pair.remoteCandidateId);
+  return { local: (l && (l.address || l.ip)) || "", remote: (r && (r.address || r.ip)) || "" };
+}
+// pcIp: PC側のアドレス（分かれば）、iphoneIp: iPhone側のアドレス
+const isIPv4 = (s) => /^\d+\.\d+\.\d+\.\d+$/.test(s || "");
+function routeOf(pcIp, iphoneIp) {
+  const a = isIPv4(pcIp) ? pcAdapter(pcIp) : null;
+  if (a) return { kind: a.kind, label: a.desc || a.label, pc: pcIp, iphone: iphoneIp || "" };
+  // PC側が分からないときは、iPhoneのアドレスと同じネットワーク(/24)のPCアダプタを探す
+  if (isIPv4(iphoneIp)) {
+    const pre = iphoneIp.split(".").slice(0, 3).join(".") + ".";
+    const m = ((netinfo && netinfo.endpoints) || []).find((e) => e.ip.indexOf(pre) === 0);
+    if (m) return { kind: m.kind, label: m.desc || m.label, pc: m.ip, iphone: iphoneIp };
+    if (/^172\.20\.10\./.test(iphoneIp)) return { kind: "tether", label: "", pc: "", iphone: iphoneIp };
+  }
+  return { kind: "lan", label: "", pc: pcIp || "", iphone: iphoneIp || "" };
+}
+function routeText(r) {
+  if (!r) return "";
+  return (KIND_NAMES[r.kind] || r.kind) + (r.label ? "（" + r.label + "）" : "");
+}
+loadNet();
+setInterval(loadNet, 30000);
+
 async function showStats() {
   if (!started) return;
   if (!rtcLive()) {
-    rtcLine.textContent = "リアルタイム: PCの受信ページ(OBS)を待っています";
+    const h = routeOf(location.hostname, "");
+    rtcLine.textContent = "リアルタイム: PCの受信ページ(OBS)を待っています ／ 接続: " + routeText(h);
     return;
   }
   const rep = await pc.getStats();
@@ -736,6 +827,11 @@ async function showStats() {
   const lim = o.qualityLimitationReason && o.qualityLimitationReason !== "none" ? " 制限:" + o.qualityLimitationReason : "";
   rtcLine.textContent = "リアルタイム配信中 " + (o.frameWidth || "?") + "×" + (o.frameHeight || "?") + " " +
     Math.round(o.framesPerSecond || 0) + "fps " + mbps.toFixed(1) + "Mbps " + codec + lim;
+  const pr = selectedPair(rep);
+  let r = routeOf(pr && pr.remote, pr && pr.local);
+  if (r.kind === "lan" && !r.label) r = routeOf(location.hostname, pr && pr.local);
+  rtcLine.textContent += " ／ 経路: " + routeText(r);
+  rtcLine.style.color = r.kind === "usb" ? "#6cf" : "#8fd18f";
 }
 
 async function keepAwake() {
@@ -807,6 +903,7 @@ PC_PAGE = r"""<!DOCTYPE html>
   <h1>iPhoneから受信</h1>
   <img id="live" alt="ライブ映像" hidden>
   <p id="meta">映像待ちです。下の手順のあと、iPhoneで撮影ページを開くとここに映ります。</p>
+  <p id="route" style="font-weight:600"></p>
   <button id="keep" type="button">今の映像を保存</button>
   <p>リアルタイム映像（WebRTC）: <a id="camlink" target="_blank" rel="noopener"></a><br>
   Zoom等のカメラにするには、OBSの「ブラウザ」ソースにこのURL（?stats=1なし）を入れて「仮想カメラ開始」。受信ページは同時に1か所だけ開いてください。</p>
@@ -883,6 +980,14 @@ async function poll() {
     } else {
       meta.textContent = "映像待ちです。証明書のあと、撮影ページを開くとここに映ります。";
     }
+    const KN = { usb: "USB有線", tether: "iPhoneのインターネット共有(Wi-Fi)", wifi: "Wi-Fi", lan: "有線LAN", tailscale: "Tailscale", local: "このPC" };
+    const fmt = (r) => r ? ((KN[r.kind] || r.kind) + ((r.desc || r.label) ? "（" + (r.desc || r.label) + "）" : "")) : "";
+    const parts = [];
+    if (data.route) parts.push("リアルタイム映像: " + fmt(data.route));
+    if (data.via) parts.push("静止画・プレビュー: " + fmt(data.via));
+    const routeEl = document.getElementById("route");
+    routeEl.textContent = parts.length ? ("iPhoneとの接続 ― " + parts.join(" ／ ")) : "";
+    routeEl.style.color = (data.route && data.route.kind === "usb") || (data.via && data.via.kind === "usb") ? "#0a6ebd" : "";
     if (data.file && data.file !== current) {
       current = data.file;
       shot.hidden = false;
@@ -996,6 +1101,59 @@ async function loop() {
   }
 }
 
+
+const KIND_NAMES = { usb: "USB有線", tether: "iPhoneのインターネット共有(Wi-Fi)", wifi: "Wi-Fi", lan: "有線LAN", tailscale: "Tailscale", local: "このPC" };
+let netinfo = null;
+async function loadNet() {
+  try {
+    const res = await fetch("/netinfo", { headers: { "X-Token": TOKEN }, cache: "no-store" });
+    if (res.ok) netinfo = await res.json();
+  } catch (e) {}
+}
+function pcAdapter(ip) {
+  return ((netinfo && netinfo.endpoints) || []).find((e) => e.ip === ip) || null;
+}
+function selectedPair(rep) {
+  let pair = null;
+  rep.forEach((s) => { if (s.type === "transport" && s.selectedCandidatePairId) pair = rep.get(s.selectedCandidatePairId); });
+  if (!pair) rep.forEach((s) => { if (s.type === "candidate-pair" && s.state === "succeeded" && (s.nominated || s.selected)) pair = s; });
+  if (!pair) return null;
+  const l = rep.get(pair.localCandidateId);
+  const r = rep.get(pair.remoteCandidateId);
+  return { local: (l && (l.address || l.ip)) || "", remote: (r && (r.address || r.ip)) || "" };
+}
+// pcIp: PC側のアドレス（分かれば）、iphoneIp: iPhone側のアドレス
+const isIPv4 = (s) => /^\d+\.\d+\.\d+\.\d+$/.test(s || "");
+function routeOf(pcIp, iphoneIp) {
+  const a = isIPv4(pcIp) ? pcAdapter(pcIp) : null;
+  if (a) return { kind: a.kind, label: a.desc || a.label, pc: pcIp, iphone: iphoneIp || "" };
+  // PC側が分からないときは、iPhoneのアドレスと同じネットワーク(/24)のPCアダプタを探す
+  if (isIPv4(iphoneIp)) {
+    const pre = iphoneIp.split(".").slice(0, 3).join(".") + ".";
+    const m = ((netinfo && netinfo.endpoints) || []).find((e) => e.ip.indexOf(pre) === 0);
+    if (m) return { kind: m.kind, label: m.desc || m.label, pc: m.ip, iphone: iphoneIp };
+    if (/^172\.20\.10\./.test(iphoneIp)) return { kind: "tether", label: "", pc: "", iphone: iphoneIp };
+  }
+  return { kind: "lan", label: "", pc: pcIp || "", iphone: iphoneIp || "" };
+}
+function routeText(r) {
+  if (!r) return "";
+  return (KIND_NAMES[r.kind] || r.kind) + (r.label ? "（" + r.label + "）" : "");
+}
+loadNet();
+setInterval(loadNet, 30000);
+
+let lastRoute = null;
+async function reportRoute() {
+  if (!pc || pc.connectionState !== "connected") return;
+  const pr = selectedPair(await pc.getStats());
+  if (!pr) return;
+  // /cam 側: local = PC, remote = iPhone（PCのhost候補はmDNSで隠れることがある）
+  lastRoute = routeOf(pr.local, pr.remote);
+  api("POST", "/rtc/route", lastRoute).catch(() => {});
+}
+setInterval(() => { reportRoute().catch(() => {}); }, 2000);
+
 async function stats() {
   if (!SHOW) return;
   if (!pc || pc.connectionState !== "connected") {
@@ -1015,7 +1173,8 @@ async function stats() {
   let delay = "";
   if (i.jitterBufferEmittedCount) delay = " バッファ" + Math.round(i.jitterBufferDelay / i.jitterBufferEmittedCount * 1000) + "ms";
   info.textContent = (i.frameWidth || "?") + "x" + (i.frameHeight || "?") + " " + Math.round(i.framesPerSecond || 0) + "fps " +
-    mbps.toFixed(1) + "Mbps " + codec + delay + "\n欠落フレーム " + (i.framesDropped || 0) + " / パケットロス " + (i.packetsLost || 0);
+    mbps.toFixed(1) + "Mbps " + codec + delay + "\n欠落フレーム " + (i.framesDropped || 0) + " / パケットロス " + (i.packetsLost || 0) +
+    (lastRoute ? "\n経路: " + routeText(lastRoute) + " " + (lastRoute.iphone || "") : "");
 }
 
 (async () => {
@@ -1148,6 +1307,14 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 2 and parts[0] == "rtc":
             self.rtc_get(parts[1])
             return
+        if parts == ["netinfo"]:
+            if not self.authorized():
+                self.send_json(403, {"ok": False})
+                return
+            with LOCK:
+                ips = list(ADAPTERS)
+            self.send_json(200, {"ok": True, "endpoints": [adapter_info(ip) for ip in ips]})
+            return
         if parts == ["latest"]:
             if not self.authorized():
                 self.send_json(403, {"ok": False})
@@ -1221,6 +1388,21 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, body)
 
     def rtc_post(self, name: str) -> None:
+        if name == "route":
+            raw = self.read_body(4096)
+            try:
+                msg = json.loads(raw.decode("utf-8")) if raw else None
+            except (UnicodeDecodeError, ValueError):
+                msg = None
+            if not isinstance(msg, dict):
+                self.send_json(400, {"ok": False})
+                return
+            clean = {k: str(msg.get(k, ""))[:80] for k in ("kind", "label", "iphone", "pc")}
+            with LOCK:
+                ROUTE["data"] = clean
+                ROUTE["at"] = time.time()
+            self.send_json(200, {"ok": True})
+            return
         if name == "request":
             with LOCK:
                 RTC["want"] += 1
@@ -1306,6 +1488,14 @@ class Handler(BaseHTTPRequestHandler):
         if data is None or not data or data[:2] != b"\xff\xd8":
             self.send_json(400, {"ok": False, "error": "JPEGとして読めませんでした"})
             return
+        if not self.is_loopback():
+            try:
+                local_ip = self.connection.getsockname()[0]
+            except OSError:
+                local_ip = ""
+            with LOCK:
+                VIA["ip"] = local_ip
+                VIA["at"] = time.time()
         if parts == ["frame"]:
             size = remember_frame(data)
             body = {"ok": True}
