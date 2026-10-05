@@ -47,6 +47,32 @@ PERMITTED_DNS = ["localhost"]
 ADAPTERS: dict = {}
 VIA = {"ip": "", "at": 0.0}
 ROUTE = {"data": None, "at": 0.0}
+# PC受信ページ → iPhone撮影ページへの操作。iPhoneはロングポーリングで受け取り、状態を毎秒報告する
+CTRL = {"next": 0, "cmds": [], "state": None, "state_at": 0.0}
+CTRL_COND = threading.Condition()
+CTRL_WAIT = 8.0
+CTRL_KEEP = 20
+MAX_STATE = 8192
+
+
+def ctrl_command(msg: object) -> dict | None:
+    """PCから来た操作を検証して {action, value} にする。不正なら None。"""
+    if not isinstance(msg, dict):
+        return None
+    action = msg.get("action")
+    value = msg.get("value")
+    if action in ("start", "stop", "shoot"):
+        return {"action": action, "value": None}
+    if action == "facing" and value in ("environment", "user"):
+        return {"action": action, "value": value}
+    if action == "quality" and value in ("720", "1080", "2160"):
+        return {"action": action, "value": value}
+    if action in ("mic", "torch") and isinstance(value, bool):
+        return {"action": action, "value": value}
+    if action == "zoom" and isinstance(value, (int, float)) and not isinstance(value, bool):
+        if 0.1 <= float(value) <= 100:
+            return {"action": action, "value": float(value)}
+    return None
 
 
 def classify(ip: str, label: str, desc: str) -> str:
@@ -263,6 +289,51 @@ def status() -> dict:
     if route and time.time() - route_at < 6:
         record["route"] = route
     return record
+
+
+def shot_list(limit: int) -> dict:
+    """キャプチャー一覧（新しい順）。サイズはキャッシュする。"""
+    files = sorted(CAPTURES.glob("*.jpg"), key=lambda p: p.stat().st_mtime, reverse=True)
+    items = []
+    for path in files[:limit]:
+        with LOCK:
+            known = path.name in SIZE_CACHE
+            size = SIZE_CACHE.get(path.name)
+        if not known:
+            try:
+                size = jpeg_size(path.read_bytes())
+            except OSError:
+                continue
+            with LOCK:
+                SIZE_CACHE[path.name] = size
+        st = path.stat()
+        item = {"name": path.name, "bytes": st.st_size, "mtime": int(st.st_mtime)}
+        if size:
+            item["width"], item["height"] = size
+        items.append(item)
+    return {"ok": True, "total": len(files), "items": items}
+
+
+def capture_path(name: str) -> Path | None:
+    """captures/ 直下の .jpg だけを許可する。"""
+    if not name or name != Path(name).name or Path(name).suffix.lower() != ".jpg":
+        return None
+    path = (CAPTURES / name).resolve()
+    if CAPTURES.resolve() not in path.parents or not path.is_file():
+        return None
+    return path
+
+
+def open_in_paint(path: Path) -> str:
+    """Windowsのペイントで開く。ペイントが無ければ既定のアプリで開く。"""
+    if os.name != "nt":
+        raise OSError("ペイントで開けるのはWindowsだけです")
+    try:
+        subprocess.Popen(["mspaint.exe", str(path)])
+        return "paint"
+    except OSError:
+        os.startfile(str(path))  # type: ignore[attr-defined]
+        return "default"
 
 
 def ensure_certs(ips: list[str]) -> tuple[Path, Path]:
@@ -485,6 +556,7 @@ PHONE_PAGE = r"""<!DOCTYPE html>
   <video id="cam" autoplay playsinline muted></video>
   <p id="status">カメラを開始すると、PCに映像が出ます。</p>
   <p id="rtc"></p>
+  <p id="remote" class="note"></p>
   <p class="note">映像は動画の解像度です。細かい静止画は「高解像度で撮影」です。</p>
   <img id="shot" class="shot" alt="" hidden>
 </main>
@@ -561,6 +633,7 @@ async function startCamera() {
   status.textContent = "カメラを開始しています…";
   if (stream) stream.getTracks().forEach((track) => track.stop());
   const videoOpt = Object.assign({ facingMode: { ideal: facing }, frameRate: { ideal: 30 } }, SIZES[quality.value] || SIZES["1080"]);
+  lastVideoOpt = videoOpt;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: micOn ? { echoCancellation: true, noiseSuppression: true, autoGainControl: true } : false,
@@ -589,7 +662,25 @@ async function startCamera() {
   if (!timer) timer = setInterval(sendFrame, 150);
   started = true;
   keepAwake();
+  // 開き直したカメラにもズーム・ライトを引き継ぐ（対応していれば）
+  if (desiredZoom !== 1 || desiredTorch) await applyCamera().catch(() => {});
   attachTrack().catch(() => {});
+  pushState();
+}
+
+function stopCamera() {
+  if (stream) stream.getTracks().forEach((track) => track.stop());
+  stream = null;
+  started = false;
+  video.srcObject = null;
+  if (timer) { clearInterval(timer); timer = 0; }
+  if (pc) { pc.close(); pc = null; }
+  if (wake) { wake.release().catch(() => {}); wake = null; }
+  desiredTorch = false;
+  document.getElementById("go").textContent = "カメラを開始";
+  status.textContent = "停止しました。";
+  rtcLine.textContent = "";
+  pushState();
 }
 
 async function sendFrame() {
@@ -898,6 +989,167 @@ quality.addEventListener("change", () => { if (stream) startCamera(); });
 setInterval(() => { showStats().catch(() => {}); }, 1000);
 watchWant();
 
+// ---- PC受信ページからの操作 ----
+const remoteLine = document.getElementById("remote");
+let lastVideoOpt = null;
+let desiredZoom = 1;
+let desiredTorch = false;
+let lastCmdId = 0;
+let lastCmdMsg = "";
+const CMD_NAMES = { start: "カメラ開始", stop: "停止", facing: "カメラ切替", quality: "画質", mic: "マイク", zoom: "ズーム", torch: "ライト", shoot: "撮影" };
+
+function liveTrack() {
+  const t = stream && stream.getVideoTracks()[0];
+  return t && t.readyState === "live" ? t : null;
+}
+function camCaps() {
+  const t = liveTrack();
+  try { return (t && t.getCapabilities) ? (t.getCapabilities() || {}) : {}; } catch (e) { return {}; }
+}
+
+// ズーム・ライトを反映する。applyConstraints は制約を丸ごと置き換えるので、解像度などの基本制約も付け直す。
+// zoom・torch は advanced ではなく基本制約に入れる。Safari(WebKit)は advanced の制約セットを1つしか採用せず、
+// [{zoom}, {torch}] と分けると torch が捨てられる。また advanced の torch:false は満たせない扱いで消灯できない
+async function applyCamera() {
+  const t = liveTrack();
+  if (!t) throw new Error("カメラが止まっています");
+  const c = camCaps();
+  const opt = Object.assign({}, lastVideoOpt || {});
+  let any = false;
+  if (c.zoom && typeof c.zoom.max === "number") {
+    desiredZoom = Math.min(c.zoom.max, Math.max(c.zoom.min, desiredZoom));
+    opt.zoom = desiredZoom;
+    any = true;
+  }
+  if (c.torch) {
+    opt.torch = desiredTorch;
+    any = true;
+  }
+  if (!any) return;
+  await t.applyConstraints(opt);
+}
+
+function camState() {
+  const t = liveTrack();
+  const c = camCaps();
+  let s = {};
+  try { s = t ? t.getSettings() : {}; } catch (e) {}
+  return {
+    running: !!t,
+    facing: facing,
+    quality: quality.value,
+    mic: micOn,
+    zoom: (c.zoom && typeof c.zoom.max === "number") ?
+      { min: c.zoom.min, max: c.zoom.max, step: c.zoom.step || 0.1, value: typeof s.zoom === "number" ? s.zoom : desiredZoom } : null,
+    torch: c.torch ? { on: typeof s.torch === "boolean" ? s.torch : desiredTorch } : null,
+    width: s.width || video.videoWidth || 0,
+    height: s.height || video.videoHeight || 0,
+    rtc: rtcLive(),
+    status: status.textContent,
+    cmdId: lastCmdId,
+    cmdMsg: lastCmdMsg,
+  };
+}
+let pushing = false;
+async function pushState() {
+  if (pushing) return;
+  pushing = true;
+  try { await api("POST", "/ctrl/state", camState()); } catch (e) {}
+  pushing = false;
+}
+
+async function runCmd(c) {
+  const v = c.value;
+  switch (c.action) {
+    case "start":
+      if (!liveTrack()) await startCamera();
+      break;
+    case "stop":
+      stopCamera();
+      break;
+    case "facing":
+      if (v !== facing) {
+        facing = v;
+        desiredZoom = 1;
+        desiredTorch = false;
+        if (stream) await startCamera();
+      }
+      break;
+    case "quality":
+      if (v !== quality.value) {
+        quality.value = v;
+        if (stream) await startCamera();
+      }
+      break;
+    case "mic":
+      if (v !== micOn) {
+        micOn = v;
+        updateMicButton();
+        if (stream) await startCamera();
+      }
+      break;
+    case "zoom":
+      desiredZoom = v;
+      if (!liveTrack()) throw new Error("カメラが止まっています");
+      if (!camCaps().zoom) throw new Error("このカメラ・iOSではズームを変えられません");
+      await applyCamera();
+      break;
+    case "torch":
+      if (!liveTrack()) throw new Error("カメラが止まっています");
+      if (!camCaps().torch) throw new Error("このカメラ・iOSではライトを使えません");
+      desiredTorch = v;
+      await applyCamera();
+      await sleep(400);
+      {
+        const t = liveTrack();
+        const now = t && t.getSettings ? t.getSettings().torch : undefined;
+        if (typeof now === "boolean" && now !== v) {
+          throw new Error("iPhoneがライトを" + (v ? "点けませんでした（本体が熱い・電池残量が少ないと点きません）" : "消しませんでした"));
+        }
+      }
+      break;
+    case "shoot":
+      await saveView();
+      break;
+  }
+}
+
+async function runCmds(list) {
+  // ズーム・ライトは連続で届くので最後の1つだけ実行する
+  const lastOf = {};
+  list.forEach((c, i) => { if (c.action === "zoom" || c.action === "torch") lastOf[c.action] = i; });
+  for (let i = 0; i < list.length; i++) {
+    const c = list[i];
+    if (c.action in lastOf && lastOf[c.action] !== i) continue;
+    const name = CMD_NAMES[c.action] || c.action;
+    try {
+      await runCmd(c);
+      lastCmdMsg = name + ": 完了";
+      if (c.action === "start" && !liveTrack()) lastCmdMsg = name + ": 失敗（" + status.textContent + "）";
+    } catch (err) {
+      lastCmdMsg = name + ": 失敗（" + ((err && err.message) || err) + "）";
+    }
+    lastCmdId = c.id;
+    remoteLine.textContent = "PCから操作 ― " + lastCmdMsg;
+    await pushState();
+  }
+}
+
+async function watchCmd() {
+  let since = -1;
+  for (;;) {
+    try {
+      const r = await api("GET", "/ctrl/cmd?since=" + since);
+      if (since >= 0 && r.cmds && r.cmds.length) await runCmds(r.cmds);
+      since = r.id;
+    } catch (e) {
+      await sleep(1000);
+    }
+  }
+}
+watchCmd();
+setInterval(() => { if (document.visibilityState === "visible") pushState(); }, 1000);
+
 document.getElementById("go").addEventListener("click", () => {
   if (stream) facing = facing === "environment" ? "user" : "environment";
   startCamera();
@@ -929,56 +1181,179 @@ PC_PAGE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>iPhoneから受信</title>
 <style>
-  body { margin: 0; font-family: "Segoe UI", "Yu Gothic UI", sans-serif; background: #f4f4f4; color: #1a1a1a; }
-  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 48px; }
-  h1 { font-size: 24px; margin: 0 0 8px; }
-  p { line-height: 1.5; }
-  #live, #shot { display: block; width: 100%; max-height: 62vh; object-fit: contain; background: #111; }
-  button { font-size: 16px; padding: 10px 16px; margin: 8px 0; }
-  .qrs { display: flex; gap: 24px; flex-wrap: wrap; margin-top: 8px; }
-  .qrbox { background: #fff; padding: 10px; }
-  .qrbox svg { width: 220px; height: 220px; }
-  .qrbox p { margin: 8px 0 0; font-weight: 650; }
-  ol { line-height: 1.55; }
-  #path { font-family: Consolas, monospace; font-size: 14px; word-break: break-all; }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; }
+  body { margin: 0; font-family: "Segoe UI", "Yu Gothic UI", sans-serif; background: #f2f2f2; color: #1a1a1a;
+         display: grid; grid-template-rows: auto minmax(0, 1fr) auto; grid-template-columns: minmax(0, 1fr); height: 100vh; overflow: hidden; }
+  header, #main, footer { min-width: 0; }
+  button { font: inherit; font-size: 14px; padding: 6px 12px; border: 1px solid #bbb; border-radius: 6px; background: #fff; cursor: pointer; }
+  button:hover:not(:disabled) { background: #eaeaea; }
+  button:disabled { opacity: .45; cursor: default; }
+  select { font: inherit; font-size: 14px; padding: 5px 6px; }
+  a { color: #0a6ebd; }
+
+  header { display: flex; align-items: center; gap: 14px; padding: 8px 14px; background: #fff; border-bottom: 1px solid #ddd; }
+  header h1 { font-size: 17px; margin: 0; white-space: nowrap; }
+  #route { font-size: 13px; font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  #main { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 10px; padding: 10px 14px; min-height: 0; }
+  #stage { position: relative; display: flex; flex-direction: column; min-height: 0; }
+  #view { position: relative; flex: 1; min-height: 0; background: #111; border-radius: 6px; overflow: hidden; }
+  #live { display: block; width: 100%; height: 100%; object-fit: contain; }
+  #wait { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #aaa; font-size: 15px; text-align: center; padding: 20px; }
+  .bar { display: flex; align-items: center; gap: 10px; padding-top: 6px; font-size: 13px; flex-wrap: wrap; }
+  #meta { flex: 1; min-width: 0; }
+
+  /* 接続用QR（iPhone未接続のときだけ映像の上に出す） */
+  #setup { position: absolute; inset: 0 0 34px 0; background: #fff; border-radius: 6px; padding: 14px 18px; overflow: auto; border: 1px solid #ddd; }
+  #setup h2 { font-size: 16px; margin: 0 0 8px; display: flex; justify-content: space-between; align-items: center; }
+  .qrs { display: flex; gap: 18px; flex-wrap: wrap; }
+  .qrbox { text-align: center; }
+  .qrbox svg { width: 190px; height: 190px; display: block; }
+  .qrbox p { margin: 4px 0 0; font-weight: 650; font-size: 14px; }
+  #setup ol { line-height: 1.5; font-size: 14px; padding-left: 20px; margin: 8px 0; }
+  #setup .note { font-size: 13px; color: #555; margin: 4px 0; }
+
+  #side { display: flex; flex-direction: column; gap: 10px; min-height: 0; overflow: auto; }
+  .card { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 10px 12px; }
+  .card h2 { font-size: 14px; margin: 0 0 6px; }
+  #ctrl .row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 6px 0; font-size: 14px; }
+  #ctrl .row > span.k { width: 3.6em; font-weight: 600; font-size: 13px; }
+  #ctrl button[aria-pressed="true"] { background: #1a1a1a; color: #fff; border-color: #1a1a1a; }
+  #czoom { flex: 1; min-width: 100px; }
+  #czoomv { font-size: 12px; color: #555; width: 100%; padding-left: 3.6em; }
+  #cstate { font-weight: 600; font-size: 13px; margin: 0 0 4px; }
+  #cstate.off { color: #b33; }
+  #cmsg { color: #555; font-size: 12px; margin: 4px 0 0; min-height: 1.3em; }
+  #shot { display: block; width: 100%; max-height: 24vh; object-fit: contain; background: #111; cursor: pointer; border-radius: 4px; }
+  #saved { font-size: 12px; color: #555; margin: 4px 0 0; }
+
+  footer { background: #fff; border-top: 1px solid #ddd; padding: 6px 14px 8px; }
+  .striphead { display: flex; align-items: center; gap: 12px; font-size: 13px; margin-bottom: 6px; }
+  .striphead b { white-space: nowrap; }
+  #path { font-family: Consolas, monospace; font-size: 12px; color: #555; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #smsg { color: #0a6ebd; white-space: nowrap; }
+  #thumbs { width: 100%; display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; min-height: 108px; }
+  .th { flex: 0 0 auto; width: 150px; border: 0; padding: 0; background: none; text-align: left; cursor: pointer; border-radius: 4px; }
+  .th img { display: block; width: 150px; height: 88px; object-fit: cover; background: #ddd; border-radius: 4px; border: 2px solid transparent; }
+  .th:hover img { border-color: #0a6ebd; }
+  .th span { display: block; font-size: 11px; color: #555; margin-top: 2px; white-space: nowrap; }
+  #thumbs .empty { color: #888; font-size: 13px; align-self: center; }
+
+  /* 狭い画面では縦に並べてスクロール */
+  @media (max-width: 860px) {
+    body { display: block; height: auto; overflow: auto; }
+    #main { grid-template-columns: 1fr; }
+    #view { height: 56vw; flex: none; }
+    #setup { position: static; margin-bottom: 8px; }
+  }
 </style>
 </head>
 <body>
-<main>
+<header>
   <h1>iPhoneから受信</h1>
-  <img id="live" alt="ライブ映像" hidden>
-  <p id="meta">映像待ちです。下の手順のあと、iPhoneで撮影ページを開くとここに映ります。</p>
-  <p id="route" style="font-weight:600"></p>
-  <button id="keep" type="button">今の映像を保存</button>
-  <p>リアルタイム映像（WebRTC）: <a id="camlink" target="_blank" rel="noopener"></a><br>
-  Zoom等のカメラにするには、OBSの「ブラウザ」ソースにこのURL（?stats=1なし）を入れて「仮想カメラ開始」。受信ページは同時に1か所だけ開いてください。</p>
-  <div class="qrs">
-    <div class="qrbox"><div id="qr-setup"></div><p>1. 証明書</p></div>
-    <div class="qrbox"><div id="qr-camera"></div><p>2. 撮影ページ</p></div>
+  <span id="route"></span>
+  <button id="qrtoggle" type="button">接続用QRを表示</button>
+</header>
+
+<div id="main">
+  <section id="stage">
+    <div id="view">
+      <img id="live" alt="ライブ映像" hidden>
+      <div id="wait">映像待ちです。iPhoneで撮影ページを開き「カメラを開始」を押してください。</div>
+    </div>
+    <div class="bar">
+      <span id="meta"></span>
+      <button id="keep" type="button">今の映像を保存</button>
+      <span>OBS用: <a id="camlink" target="_blank" rel="noopener" title="OBSのブラウザソースには ?stats=1 なしで入れる。受信ページ(/cam)は同時に1か所だけ"></a></span>
+    </div>
+    <div id="setup" hidden>
+      <h2>iPhoneの接続 <button id="qrclose" type="button">閉じる</button></h2>
+      <div class="qrs">
+        <div class="qrbox"><div id="qr-setup"></div><p>1. 証明書（初回のみ）</p></div>
+        <div class="qrbox"><div id="qr-camera"></div><p>2. 撮影ページ</p></div>
+      </div>
+      <p class="note">QRのアドレス: <select id="addr"></select>　iPhoneと同じネットワーク（Wi-Fi・USBなど）を選ぶ</p>
+      <ol>
+        <li>iPhoneのカメラで「1. 証明書」を読み、プロファイルを入れる</li>
+        <li>設定 → 一般 → VPNとデバイス管理 でインストール</li>
+        <li>設定 → 一般 → 情報 → 証明書信頼設定 で iPhone Capture Local CA をオン</li>
+        <li>「2. 撮影ページ」を読み、カメラの使用を許可する</li>
+      </ol>
+    </div>
+  </section>
+
+  <aside id="side">
+    <section id="ctrl" class="card">
+      <h2>iPhoneの操作</h2>
+      <p id="cstate" class="off">iPhoneの撮影ページが開かれていません</p>
+      <div class="row">
+        <span class="k">カメラ</span>
+        <button type="button" class="cb" id="cstart">開始</button>
+        <button type="button" class="cb" id="cstop">停止</button>
+        <button type="button" class="cb" id="cshoot" title="iPhoneの映像解像度のまま静止画を保存します">撮影して保存</button>
+      </div>
+      <div class="row">
+        <span class="k">向き</span>
+        <button type="button" class="cb" id="cback" aria-pressed="false">背面</button>
+        <button type="button" class="cb" id="cfront" aria-pressed="false">前面</button>
+        <span class="k" style="margin-left:8px">ライト</span>
+        <button type="button" class="cb" id="ctorch" aria-pressed="false">オフ</button>
+      </div>
+      <div class="row">
+        <span class="k">画質</span>
+        <select class="cb" id="cquality">
+          <option value="720">720p</option>
+          <option value="1080">1080p</option>
+          <option value="2160">4K</option>
+        </select>
+        <span class="k" style="margin-left:8px">マイク</span>
+        <button type="button" class="cb" id="cmic" aria-pressed="false">オフ</button>
+      </div>
+      <div class="row">
+        <span class="k">ズーム</span>
+        <input type="range" class="cb" id="czoom" min="1" max="1" step="0.1" value="1">
+        <button type="button" class="cb" id="czoom1">1x</button>
+        <button type="button" class="cb" id="czoom2">2x</button>
+        <span id="czoomv">-</span>
+      </div>
+      <p id="cmsg"></p>
+    </section>
+
+    <section class="card">
+      <h2>前回の取得画像</h2>
+      <img id="shot" alt="" title="クリックでペイントで開く" hidden>
+      <p id="saved">まだありません</p>
+    </section>
+  </aside>
+</div>
+
+<footer>
+  <div class="striphead">
+    <b>キャプチャー <span id="count"></span></b>
+    <span id="path"></span>
+    <span id="smsg"></span>
+    <button id="more" type="button" hidden>さらに表示</button>
   </div>
-  <p id="which">QRのアドレス: <select id="addr"></select></p>
-  <p class="note">iPhoneがつながっているネットワーク（Wi-Fiなど）と同じアドレスを選んでください。</p>
-  <ol>
-    <li>iPhoneのカメラで「1. 証明書」を読み、リンクを開く</li>
-    <li>プロファイルを入れ、設定 → 一般 → VPNとデバイス管理 でインストール</li>
-    <li>設定 → 一般 → 情報 → 証明書信頼設定 で iPhone Capture Local CA をオン</li>
-    <li>「2. 撮影ページ」を読み、カメラの使用を許可する</li>
-  </ol>
-  <p id="saved"></p>
-  <img id="shot" alt="" hidden>
-  <p id="path"></p>
-</main>
+  <div id="thumbs"><span class="empty">まだありません</span></div>
+</footer>
+
 <script src="/qrcode.js"></script>
 <script>
 const DATA = __DATA__;
+const $ = (id) => document.getElementById(id);
+const K = "k=" + encodeURIComponent(DATA.token);
+
+// ---- 接続用QR ----
 function drawQr(id, text) {
   if (!text || typeof qrcode !== "function") return;
   const code = qrcode(0, "M");
   code.addData(text);
   code.make();
-  document.getElementById(id).innerHTML = code.createSvgTag(6, 2);
+  $(id).innerHTML = code.createSvgTag(6, 2);
 }
-const addrSel = document.getElementById("addr");
+const addrSel = $("addr");
 (DATA.endpoints || []).forEach((ep, i) => {
   const o = document.createElement("option");
   o.value = String(i);
@@ -987,24 +1362,44 @@ const addrSel = document.getElementById("addr");
 });
 function drawAddr() {
   const ep = (DATA.endpoints || [])[Number(addrSel.value)] || { setupUrl: DATA.setupUrl, cameraUrl: DATA.cameraUrl };
-  document.getElementById("qr-setup").innerHTML = "";
-  document.getElementById("qr-camera").innerHTML = "";
+  $("qr-setup").innerHTML = "";
+  $("qr-camera").innerHTML = "";
   drawQr("qr-setup", ep.setupUrl);
   drawQr("qr-camera", ep.cameraUrl);
 }
 addrSel.addEventListener("change", drawAddr);
 drawAddr();
-const camlink = document.getElementById("camlink");
+
+// QRはiPhoneがつながっていないときだけ自動で出す。ボタンで手動の表示/非表示もできる
+let connected = false;
+let qrManual = null;   // null=自動, true=表示, false=非表示
+function updateSetup() {
+  const show = qrManual === null ? !connected : qrManual;
+  $("setup").hidden = !show;
+  $("qrtoggle").textContent = show ? "接続用QRを隠す" : "接続用QRを表示";
+}
+function setConnected(on) {
+  if (on && !connected) qrManual = null;   // つながったら自動で隠す
+  connected = on;
+  updateSetup();
+}
+$("qrtoggle").addEventListener("click", () => { qrManual = $("setup").hidden; updateSetup(); });
+$("qrclose").addEventListener("click", () => { qrManual = false; updateSetup(); });
+updateSetup();
+
+const camlink = $("camlink");
 camlink.href = DATA.camUrl + "?stats=1";
 camlink.textContent = DATA.camUrl;
 
-const meta = document.getElementById("meta");
-const saved = document.getElementById("saved");
-const path = document.getElementById("path");
-const live = document.getElementById("live");
-const shot = document.getElementById("shot");
+// ---- 映像・状態 ----
+const meta = $("meta");
+const live = $("live");
+const shot = $("shot");
 let current = "";
-path.textContent = "保存先 " + DATA.folder;
+let liveOn = false;
+let lastCount = -1;
+$("path").textContent = DATA.folder;
+$("path").title = DATA.folder;
 
 function formatBytes(n) {
   if (n < 1024) return n + " B";
@@ -1016,44 +1411,260 @@ async function poll() {
   try {
     const res = await fetch("/latest", { headers: { "X-Token": DATA.token }, cache: "no-store" });
     const data = await res.json();
+    liveOn = !!(data.live && data.live.age < 3);
     if (data.live && data.live.age < 2) {
       live.hidden = false;
-      live.src = "/live.jpg?k=" + encodeURIComponent(DATA.token) + "&t=" + Date.now();
-      meta.textContent = data.live.width + "×" + data.live.height + " を表示中";
+      $("wait").hidden = true;
+      live.src = "/live.jpg?" + K + "&t=" + Date.now();
+      meta.textContent = "プレビュー " + data.live.width + "×" + data.live.height;
     } else if (data.live) {
       meta.textContent = "映像が止まっています。iPhoneの撮影ページを開いたままにしてください。";
     } else {
-      meta.textContent = "映像待ちです。証明書のあと、撮影ページを開くとここに映ります。";
+      meta.textContent = "";
     }
     const KN = { usb: "USB有線", tether: "iPhoneのインターネット共有(Wi-Fi)", wifi: "Wi-Fi", lan: "有線LAN", tailscale: "Tailscale", local: "このPC" };
     const fmt = (r) => r ? ((KN[r.kind] || r.kind) + ((r.desc || r.label) ? "（" + (r.desc || r.label) + "）" : "")) : "";
     const parts = [];
     if (data.route) parts.push("リアルタイム映像: " + fmt(data.route));
     if (data.via) parts.push("静止画・プレビュー: " + fmt(data.via));
-    const routeEl = document.getElementById("route");
-    routeEl.textContent = parts.length ? ("iPhoneとの接続 ― " + parts.join(" ／ ")) : "";
+    const routeEl = $("route");
+    routeEl.textContent = parts.length ? ("接続 ― " + parts.join(" ／ ")) : "";
+    routeEl.title = routeEl.textContent;
     routeEl.style.color = (data.route && data.route.kind === "usb") || (data.via && data.via.kind === "usb") ? "#0a6ebd" : "";
     if (data.file && data.file !== current) {
       current = data.file;
       shot.hidden = false;
-      shot.src = "/shots/" + encodeURIComponent(data.file) + "?k=" + encodeURIComponent(DATA.token);
+      shot.src = "/shots/" + encodeURIComponent(data.file) + "?" + K;
     }
     if (data.file) {
       const dims = (data.width && data.height) ? (data.width + "×" + data.height + "（" + data.megapixels + "MP） ") : "";
-      saved.textContent = "最後の静止画 " + dims + formatBytes(data.bytes || 0);
-      path.textContent = data.path || DATA.folder;
+      $("saved").textContent = data.file + "  " + dims + formatBytes(data.bytes || 0);
+    }
+    if (data.count !== lastCount) {
+      lastCount = data.count;
+      loadShots();
     }
   } catch (err) {
     meta.textContent = "画面の更新に失敗しました。";
   }
+  setConnected(liveOn || online);
 }
-document.getElementById("keep").addEventListener("click", async () => {
+$("keep").addEventListener("click", async () => {
   const res = await fetch("/save-live", { method: "POST", headers: { "X-Token": DATA.token } });
   const data = await res.json().catch(() => ({}));
   meta.textContent = data.ok ? ("保存しました " + data.width + "×" + data.height) : (data.error || "保存できませんでした");
 });
+
+// ---- キャプチャー一覧（サムネイル、クリックでペイント） ----
+let shotLimit = 60;
+const thumbUrl = new Map();   // ファイル名 → 縮小画像のURL
+const thumbQueue = [];
+let thumbBusy = false;
+let loadingShots = false;
+
+async function openPaint(name) {
+  $("smsg").textContent = "開いています…";
+  try {
+    const res = await fetch("/open", {
+      method: "POST",
+      headers: { "X-Token": DATA.token, "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const d = await res.json().catch(() => ({}));
+    $("smsg").textContent = d.ok ? (d.how === "paint" ? "ペイントで開きました: " : "既定のアプリで開きました: ") + name : (d.error || "開けませんでした");
+  } catch (e) {
+    $("smsg").textContent = "開けませんでした";
+  }
+}
+shot.addEventListener("click", () => { if (current) openPaint(current); });
+
+// 元画像は大きい（数MB・4K以上）ので、1枚ずつ縮小してから並べる
+async function makeThumb(name) {
+  const res = await fetch("/shots/" + encodeURIComponent(name) + "?" + K, { cache: "force-cache" });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const blob = await res.blob();
+  const bmp = await createImageBitmap(blob, { resizeWidth: 300, resizeQuality: "medium" });
+  const c = document.createElement("canvas");
+  c.width = bmp.width;
+  c.height = bmp.height;
+  c.getContext("2d").drawImage(bmp, 0, 0);
+  bmp.close && bmp.close();
+  const small = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.8));
+  return URL.createObjectURL(small);
+}
+async function runThumbs() {
+  if (thumbBusy) return;
+  thumbBusy = true;
+  while (thumbQueue.length) {
+    const { name, img } = thumbQueue.shift();
+    if (thumbUrl.has(name)) { img.src = thumbUrl.get(name); continue; }
+    try {
+      const url = await makeThumb(name);
+      thumbUrl.set(name, url);
+      img.src = url;
+    } catch (e) {
+      img.src = "/shots/" + encodeURIComponent(name) + "?" + K;
+    }
+  }
+  thumbBusy = false;
+}
+function stamp(item) {
+  const m = /^shot_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/.exec(item.name);
+  const t = m ? (m[2] + "/" + m[3] + " " + m[4] + ":" + m[5] + ":" + m[6]) : item.name;
+  return t + (item.width ? "  " + item.width + "×" + item.height : "");
+}
+async function loadShots() {
+  if (loadingShots) return;
+  loadingShots = true;
+  try {
+    const res = await fetch("/shots-list?limit=" + shotLimit, { headers: { "X-Token": DATA.token }, cache: "no-store" });
+    const d = await res.json();
+    const box = $("thumbs");
+    $("count").textContent = "（" + d.total + "枚）";
+    $("more").hidden = d.total <= d.items.length;
+    if (!d.items.length) {
+      box.innerHTML = '<span class="empty">まだありません</span>';
+      return;
+    }
+    const keep = new Set(d.items.map((x) => x.name));
+    for (const [name, url] of thumbUrl) {
+      if (!keep.has(name)) { URL.revokeObjectURL(url); thumbUrl.delete(name); }
+    }
+    const old = new Map();
+    box.querySelectorAll(".th").forEach((el) => old.set(el.dataset.name, el));
+    box.textContent = "";
+    d.items.forEach((item) => {
+      let el = old.get(item.name);
+      if (!el) {
+        el = document.createElement("button");
+        el.type = "button";
+        el.className = "th";
+        el.dataset.name = item.name;
+        el.title = item.name + "\nクリックでペイントで開く";
+        const img = document.createElement("img");
+        img.alt = item.name;
+        const cap = document.createElement("span");
+        cap.textContent = stamp(item);
+        el.append(img, cap);
+        el.addEventListener("click", () => openPaint(item.name));
+        if (thumbUrl.has(item.name)) img.src = thumbUrl.get(item.name);
+        else thumbQueue.push({ name: item.name, img });
+      }
+      box.appendChild(el);
+    });
+    runThumbs();
+  } catch (e) {
+    $("smsg").textContent = "一覧を読めませんでした";
+  } finally {
+    loadingShots = false;
+  }
+}
+$("more").addEventListener("click", () => { shotLimit += 60; loadShots(); });
+// 縦ホイールで横スクロール
+$("thumbs").addEventListener("wheel", (e) => {
+  if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) { $("thumbs").scrollLeft += e.deltaY; e.preventDefault(); }
+}, { passive: false });
+
+// ---- iPhoneの操作 ----
+const cstate = $("cstate");
+const cmsg = $("cmsg");
+let cs = null;          // iPhoneから最後に届いた状態
+let online = false;
+let zoomHoldUntil = 0;  // スライダー操作中は状態でつまみを動かさない
+let zoomTimer = 0;
+let sentId = 0;
+const FACING = { environment: "背面", user: "前面" };
+
+async function ctrl(action, value) {
+  try {
+    const res = await fetch("/ctrl/cmd", {
+      method: "POST",
+      headers: { "X-Token": DATA.token, "Content-Type": "application/json" },
+      body: JSON.stringify({ action, value }),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || !d.ok) { cmsg.textContent = d.error || "送れませんでした"; return; }
+    sentId = d.id;
+    cmsg.textContent = d.online ? "iPhoneへ送りました…" : "送りましたが、iPhoneの撮影ページが応答していません";
+  } catch (e) {
+    cmsg.textContent = "送れませんでした";
+  }
+}
+
+function setPressed(el, on) { el.setAttribute("aria-pressed", on ? "true" : "false"); }
+function zoomText(z) { return (Math.round(z * 10) / 10) + "x"; }
+
+function renderCtrl() {
+  const s = cs;
+  const run = online && s && s.running;
+  document.querySelectorAll("#ctrl .cb").forEach((el) => { el.disabled = !online; });
+  if (!online) {
+    cstate.className = "off";
+    cstate.textContent = s ? "iPhoneの撮影ページが応答していません（画面ロック・Safariが裏に回った等）" : "iPhoneの撮影ページが開かれていません";
+    return;
+  }
+  cstate.className = "";
+  cstate.textContent = run ? ("撮影中 " + (s.width && s.height ? s.width + "×" + s.height + " " : "") +
+    FACING[s.facing] + (s.rtc ? " ／ リアルタイム接続中" : " ／ リアルタイム未接続（/cam を開く）")) : "停止中（向き・画質・マイクは次の開始時に反映）";
+  $("cstop").disabled = !run;
+  $("cshoot").disabled = !run;
+  $("cstart").disabled = !!run;
+  setPressed($("cback"), s.facing === "environment");
+  setPressed($("cfront"), s.facing === "user");
+  if (document.activeElement !== $("cquality")) $("cquality").value = s.quality;
+  setPressed($("cmic"), s.mic);
+  $("cmic").textContent = s.mic ? "オン" : "オフ";
+  const z = run ? s.zoom : null;
+  ["czoom", "czoom1", "czoom2"].forEach((id) => { $(id).disabled = !z; });
+  if (z) {
+    const r = $("czoom");
+    r.min = z.min; r.max = z.max; r.step = z.step > 0 && z.step < 1 ? z.step : 0.1;
+    $("czoom2").disabled = z.max < 2;
+    if (Date.now() > zoomHoldUntil) { r.value = z.value; $("czoomv").textContent = zoomText(z.value) + "（" + zoomText(z.min) + "〜" + zoomText(z.max) + "）"; }
+  } else {
+    $("czoomv").textContent = run ? "このカメラ・iOSでは非対応" : "-";
+  }
+  const t = run ? s.torch : null;
+  $("ctorch").disabled = !t;
+  setPressed($("ctorch"), !!(t && t.on));
+  $("ctorch").textContent = t ? (t.on ? "オン" : "オフ") : (run ? "非対応" : "オフ");
+  if (s.cmdMsg && s.cmdId && s.cmdId >= sentId) cmsg.textContent = "iPhone: " + s.cmdMsg;
+}
+
+async function pollCtrl() {
+  try {
+    const res = await fetch("/ctrl/state", { headers: { "X-Token": DATA.token }, cache: "no-store" });
+    const d = await res.json();
+    cs = d.state;
+    online = !!(d.state && d.age !== null && d.age < 4);
+  } catch (e) {
+    online = false;
+  }
+  renderCtrl();
+}
+
+$("cstart").addEventListener("click", () => ctrl("start"));
+$("cstop").addEventListener("click", () => ctrl("stop"));
+$("cshoot").addEventListener("click", () => ctrl("shoot"));
+$("cback").addEventListener("click", () => ctrl("facing", "environment"));
+$("cfront").addEventListener("click", () => ctrl("facing", "user"));
+$("cquality").addEventListener("change", (e) => ctrl("quality", e.target.value));
+$("cmic").addEventListener("click", () => ctrl("mic", !(cs && cs.mic)));
+$("ctorch").addEventListener("click", () => ctrl("torch", !(cs && cs.torch && cs.torch.on)));
+function sendZoom(z) {
+  zoomHoldUntil = Date.now() + 1500;
+  $("czoomv").textContent = zoomText(z);
+  if (zoomTimer) return;
+  zoomTimer = setTimeout(() => { zoomTimer = 0; ctrl("zoom", Number($("czoom").value)); }, 120);
+}
+$("czoom").addEventListener("input", (e) => sendZoom(Number(e.target.value)));
+$("czoom1").addEventListener("click", () => { $("czoom").value = 1; sendZoom(1); });
+$("czoom2").addEventListener("click", () => { $("czoom").value = 2; sendZoom(2); });
+
 poll();
 setInterval(poll, 200);
+pollCtrl();
+setInterval(pollCtrl, 500);
 </script>
 </body>
 </html>
@@ -1374,6 +1985,9 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 2 and parts[0] == "rtc":
             self.rtc_get(parts[1])
             return
+        if len(parts) == 2 and parts[0] == "ctrl":
+            self.ctrl_get(parts[1])
+            return
         if parts == ["netinfo"]:
             if not self.authorized():
                 self.send_json(403, {"ok": False})
@@ -1387,6 +2001,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(403, {"ok": False})
                 return
             self.send_json(200, status())
+            return
+        if parts == ["shots-list"]:
+            if not self.authorized():
+                self.send_json(403, {"ok": False})
+                return
+            try:
+                limit = int(parse_qs(urlparse(self.path).query).get("limit", ["60"])[0])
+            except ValueError:
+                limit = 60
+            self.send_json(200, shot_list(max(1, min(limit, 1000))))
             return
         if parts == ["live.jpg"]:
             self.send_live()
@@ -1509,6 +2133,67 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_json(404, {"ok": False})
 
+    def ctrl_get(self, name: str) -> None:
+        if not self.authorized():
+            self.send_json(403, {"ok": False})
+            return
+        query = parse_qs(urlparse(self.path).query)
+        if name == "cmd":
+            # iPhone用。since より新しい操作が来るまで最大 CTRL_WAIT 秒待つ。since<0 は現在の番号だけ返す
+            try:
+                since = int(query.get("since", ["-1"])[0])
+            except ValueError:
+                since = -1
+            deadline = time.time() + CTRL_WAIT
+            with CTRL_COND:
+                if since >= 0:
+                    while CTRL["next"] <= since:
+                        left = deadline - time.time()
+                        if left <= 0:
+                            break
+                        CTRL_COND.wait(left)
+                body = {"ok": True, "id": CTRL["next"],
+                        "cmds": [c for c in CTRL["cmds"] if since >= 0 and c["id"] > since]}
+            self.send_json(200, body)
+            return
+        if name == "state":
+            with CTRL_COND:
+                state, at = CTRL["state"], CTRL["state_at"]
+            age = round(time.time() - at, 1) if state else None
+            self.send_json(200, {"ok": True, "state": state, "age": age})
+            return
+        self.send_json(404, {"ok": False})
+
+    def ctrl_post(self, name: str) -> None:
+        raw = self.read_body(MAX_STATE)
+        try:
+            msg = json.loads(raw.decode("utf-8")) if raw else None
+        except (UnicodeDecodeError, ValueError):
+            msg = None
+        if name == "cmd":
+            cmd = ctrl_command(msg)
+            if cmd is None:
+                self.send_json(400, {"ok": False, "error": "操作の内容が読めません"})
+                return
+            with CTRL_COND:
+                CTRL["next"] += 1
+                cmd["id"] = CTRL["next"]
+                CTRL["cmds"] = (CTRL["cmds"] + [cmd])[-CTRL_KEEP:]
+                online = CTRL["state"] is not None and time.time() - CTRL["state_at"] < 4
+                CTRL_COND.notify_all()
+            self.send_json(200, {"ok": True, "id": cmd["id"], "online": online})
+            return
+        if name == "state":
+            if not isinstance(msg, dict):
+                self.send_json(400, {"ok": False})
+                return
+            with CTRL_COND:
+                CTRL["state"] = msg
+                CTRL["state_at"] = time.time()
+            self.send_json(200, {"ok": True})
+            return
+        self.send_json(404, {"ok": False})
+
     def send_live(self) -> None:
         if not self.authorized():
             self.send_json(403, {"ok": False})
@@ -1525,11 +2210,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized():
             self.send_json(403, {"ok": False})
             return
-        if name != Path(name).name or Path(name).suffix.lower() != ".jpg":
-            self.send_json(404, {"ok": False})
-            return
-        path = (CAPTURES / name).resolve()
-        if CAPTURES.resolve() not in path.parents or not path.is_file():
+        path = capture_path(name)
+        if path is None:
             self.send_json(404, {"ok": False})
             return
         self.send_bytes(200, path.read_bytes(), "image/jpeg")
@@ -1541,6 +2223,31 @@ class Handler(BaseHTTPRequestHandler):
             return
         if len(parts) == 2 and parts[0] == "rtc":
             self.rtc_post(parts[1])
+            return
+        if len(parts) == 2 and parts[0] == "ctrl":
+            self.ctrl_post(parts[1])
+            return
+        if parts == ["open"]:
+            # PCの受信ページ（このPC自身）からだけ、キャプチャーをペイントで開く
+            if not self.is_loopback():
+                self.send_json(403, {"ok": False, "error": "このPCのブラウザからだけ使えます"})
+                return
+            raw = self.read_body(4096)
+            try:
+                msg = json.loads(raw.decode("utf-8")) if raw else None
+            except (UnicodeDecodeError, ValueError):
+                msg = None
+            name = msg.get("name") if isinstance(msg, dict) else ""
+            path = capture_path(name if isinstance(name, str) else "")
+            if path is None:
+                self.send_json(404, {"ok": False, "error": "ファイルがありません"})
+                return
+            try:
+                how = open_in_paint(path)
+            except OSError as exc:
+                self.send_json(500, {"ok": False, "error": f"開けませんでした: {exc}"})
+                return
+            self.send_json(200, {"ok": True, "how": how})
             return
         if parts == ["save-live"]:
             with LOCK:
